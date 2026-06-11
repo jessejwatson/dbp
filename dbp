@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+#
+# dbp — docker build & push
+#
+# Builds a multi-platform image with buildx and pushes all tags in one step.
+#
+# Usage:
+#   dbp -i <image> -v <version-tag> [options]
+#
+# Examples:
+#   dbp -i wallplate-manager -v 1.0.1
+#       -> builds and pushes <registry>/wallplate-manager:1.0.1 and :latest
+#
+#   dbp -i wallplate-manager -v 1.0.1 -t stable -t prod
+#       -> pushes :1.0.1, :latest, :stable, :prod
+#
+#   dbp --set-registry docker-registry.lindisfarne.nsw.edu.au
+#       -> saves the registry so -r isn't needed again
+#
+# Options:
+#   -i, --image <name>        Image name (required)
+#   -v, --version <tag>       Version tag (required)
+#   -t, --tag <tag>           Additional tag (repeatable). Default: latest
+#       --no-latest           Don't add the implicit 'latest' tag
+#   -r, --registry <host>     Registry for this run (overrides saved config)
+#       --set-registry <host> Save registry to config and exit
+#   -p, --platforms <list>    Platforms (default: linux/amd64,linux/arm64)
+#   -c, --context <path>      Build context (default: .)
+#   -f, --file <path>         Dockerfile path (passed to docker as-is)
+#       --no-cache            Build without cache
+#   -n, --dry-run             Print the docker command without running it
+#   -h, --help                Show this help
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dbp"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+DEFAULT_PLATFORMS="linux/amd64,linux/arm64"
+
+err()  { printf 'dbp: error: %s\n' "$*" >&2; exit 1; }
+info() { printf 'dbp: %s\n' "$*"; }
+
+usage() {
+  # Print the comment block at the top of this file as help text
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+load_registry() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # Config file is simple key=value; only read the registry key
+    while IFS='=' read -r key value; do
+      [[ "$key" == "registry" ]] && SAVED_REGISTRY="$value"
+    done < "$CONFIG_FILE"
+  fi
+}
+
+save_registry() {
+  mkdir -p "$CONFIG_DIR"
+  printf 'registry=%s\n' "$1" > "$CONFIG_FILE"
+  info "registry saved to $CONFIG_FILE: $1"
+}
+
+# ── Parse arguments ────────────────────────────────────────────────
+
+IMAGE=""
+VERSION=""
+REGISTRY=""
+SAVED_REGISTRY=""
+PLATFORMS="$DEFAULT_PLATFORMS"
+CONTEXT="."
+DOCKERFILE=""
+EXTRA_TAGS=()
+ADD_LATEST=1
+NO_CACHE=0
+DRY_RUN=0
+
+[[ $# -eq 0 ]] && usage 1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--image)        IMAGE="${2:?missing value for $1}"; shift 2 ;;
+    -v|--version)      VERSION="${2:?missing value for $1}"; shift 2 ;;
+    -t|--tag)          EXTRA_TAGS+=("${2:?missing value for $1}"); shift 2 ;;
+    --no-latest)       ADD_LATEST=0; shift ;;
+    -r|--registry)     REGISTRY="${2:?missing value for $1}"; shift 2 ;;
+    --set-registry)    save_registry "${2:?missing value for $1}"; exit 0 ;;
+    -p|--platforms)    PLATFORMS="${2:?missing value for $1}"; shift 2 ;;
+    -c|--context)      CONTEXT="${2:?missing value for $1}"; shift 2 ;;
+    -f|--file)         DOCKERFILE="${2:?missing value for $1}"; shift 2 ;;
+    --no-cache)        NO_CACHE=1; shift ;;
+    -n|--dry-run)      DRY_RUN=1; shift ;;
+    -h|--help)         usage 0 ;;
+    *)                 err "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+# ── Validate ───────────────────────────────────────────────────────
+
+[[ -n "$IMAGE" ]]   || err "image is required (-i)"
+[[ -n "$VERSION" ]] || err "version tag is required (-v)"
+
+load_registry
+REGISTRY="${REGISTRY:-$SAVED_REGISTRY}"
+[[ -n "$REGISTRY" ]] || err "no registry set. Use -r <host> or save one with: dbp --set-registry <host>"
+
+[[ -d "$CONTEXT" ]] || err "build context not found: $CONTEXT"
+
+if (( ! DRY_RUN )); then
+  command -v docker >/dev/null 2>&1 || err "docker not found in PATH"
+  docker buildx version >/dev/null 2>&1 || err "docker buildx is not available"
+fi
+
+# ── Assemble tags ──────────────────────────────────────────────────
+
+TAGS=("$VERSION")
+(( ADD_LATEST )) && TAGS+=("latest")
+TAGS+=("${EXTRA_TAGS[@]+"${EXTRA_TAGS[@]}"}")
+
+# De-duplicate (e.g. if someone passes -t latest explicitly)
+declare -A seen=()
+UNIQUE_TAGS=()
+for t in "${TAGS[@]}"; do
+  [[ -n "${seen[$t]:-}" ]] && continue
+  seen[$t]=1
+  UNIQUE_TAGS+=("$t")
+done
+
+# ── Build command ──────────────────────────────────────────────────
+
+CMD=(docker buildx build --platform "$PLATFORMS" --push)
+(( NO_CACHE )) && CMD+=(--no-cache)
+[[ -n "$DOCKERFILE" ]] && CMD+=(-f "$DOCKERFILE")
+
+for t in "${UNIQUE_TAGS[@]}"; do
+  CMD+=(-t "$REGISTRY/$IMAGE:$t")
+done
+
+CMD+=("$CONTEXT")
+
+# ── Run ────────────────────────────────────────────────────────────
+
+info "registry:  $REGISTRY"
+info "image:     $IMAGE"
+info "tags:      ${UNIQUE_TAGS[*]}"
+info "platforms: $PLATFORMS"
+info "context:   $CONTEXT"
+echo
+
+if (( DRY_RUN )); then
+  printf 'dry run, would execute:\n  %q' "${CMD[0]}"
+  printf ' %q' "${CMD[@]:1}"
+  printf '\n'
+  exit 0
+fi
+
+"${CMD[@]}"
+
+echo
+info "done. pushed ${#UNIQUE_TAGS[@]} tag(s) for $REGISTRY/$IMAGE"
