@@ -1,35 +1,50 @@
 #!/usr/bin/env bash
 #
-# dbp — docker build & push
+# dbp — docker build & push (and registry inspection)
 #
-# Builds a multi-platform image with buildx and pushes all tags in one step.
-#
-# Usage:
+# Build mode:
 #   dbp -i <image> -v <version-tag> [options]
 #
-# Examples:
-#   dbp -i wallplate-manager -v 1.0.1
-#       -> builds and pushes <registry>/wallplate-manager:1.0.1 and :latest
+#   Builds a multi-platform image with buildx and pushes all tags in one step.
 #
-#   dbp -i wallplate-manager -v 1.0.1 -t stable -t prod
-#       -> pushes :1.0.1, :latest, :stable, :prod
+#   Examples:
+#     dbp -i wallplate-manager -v 1.0.1
+#         -> builds and pushes <registry>/wallplate-manager:1.0.1 and :latest
+#     dbp -i wallplate-manager -v 1.0.1 -t stable -t prod
+#         -> pushes :1.0.1, :latest, :stable, :prod
+#     dbp --set-registry docker-registry.lindisfarne.nsw.edu.au
+#         -> saves the registry so -r isn't needed again
 #
-#   dbp --set-registry docker-registry.lindisfarne.nsw.edu.au
-#       -> saves the registry so -r isn't needed again
+#   Options:
+#     -i, --image <name>        Image name (required)
+#     -v, --version <tag>       Version tag (required)
+#     -t, --tag <tag>           Additional tag (repeatable). Default: latest
+#         --no-latest           Don't add the implicit 'latest' tag
+#     -r, --registry <host>     Registry for this run (overrides saved config)
+#         --set-registry <host> Save registry to config and exit
+#     -p, --platforms <list>    Platforms (default: linux/amd64,linux/arm64)
+#     -c, --context <path>      Build context (default: .)
+#     -f, --file <path>         Dockerfile path (passed to docker as-is)
+#         --no-cache            Build without cache
+#     -n, --dry-run             Print the docker command without running it
+#     -h, --help                Show this help
 #
-# Options:
-#   -i, --image <name>        Image name (required)
-#   -v, --version <tag>       Version tag (required)
-#   -t, --tag <tag>           Additional tag (repeatable). Default: latest
-#       --no-latest           Don't add the implicit 'latest' tag
-#   -r, --registry <host>     Registry for this run (overrides saved config)
-#       --set-registry <host> Save registry to config and exit
-#   -p, --platforms <list>    Platforms (default: linux/amd64,linux/arm64)
-#   -c, --context <path>      Build context (default: .)
-#   -f, --file <path>         Dockerfile path (passed to docker as-is)
-#       --no-cache            Build without cache
-#   -n, --dry-run             Print the docker command without running it
-#   -h, --help                Show this help
+# List mode:
+#   dbp ls                      List all repositories in the registry
+#   dbp ls <image>              List all tags for a repo, with digests
+#   dbp ls <image> --full       Also show platforms and created date per tag
+#                               (slower: extra API requests per tag)
+#
+#   Options:
+#     -r, --registry <host>     Registry for this run (overrides saved config)
+#                               May include a scheme, e.g. http://host:5000
+#         --full                Show platforms + created date
+#
+#   Matching digests mean two tags point at the same image.
+#   Auth is read from ~/.docker/config.json (i.e. whatever `docker login`
+#   stored), including credential helpers like osxkeychain.
+#
+# Requirements: bash 3.2+, docker buildx (build mode), curl + python3 (ls mode)
 
 set -euo pipefail
 
@@ -43,7 +58,7 @@ info() { printf 'dbp: %s\n' "$*"; }
 
 usage() {
   # Print the comment block at the top of this file as help text
-  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
   exit "${1:-0}"
 }
 
@@ -62,7 +77,183 @@ save_registry() {
   info "registry saved to $CONFIG_FILE: $1"
 }
 
-# ── Parse arguments ────────────────────────────────────────────────
+resolve_registry() {
+  load_registry
+  REGISTRY="${REGISTRY:-${SAVED_REGISTRY:-}}"
+  [[ -n "$REGISTRY" ]] || err "no registry set. Use -r <host> or save one with: dbp --set-registry <host>"
+  REGISTRY_HOST="${REGISTRY#*://}"
+  case "$REGISTRY" in
+    http://*|https://*) REGISTRY_URL="$REGISTRY" ;;
+    *)                  REGISTRY_URL="https://$REGISTRY" ;;
+  esac
+}
+
+# ── ls subcommand ──────────────────────────────────────────────────
+
+ACCEPT_MANIFEST='application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json'
+
+AUTH_ARGS=()
+
+setup_auth() {
+  # Pull basic-auth credentials for this registry out of docker's config,
+  # including credential helpers (e.g. osxkeychain on macOS).
+  local b64
+  b64=$(HOST="$REGISTRY_HOST" python3 - <<'PYEOF' 2>/dev/null
+import base64, json, os, subprocess, sys
+
+host = os.environ["HOST"]
+path = os.path.expanduser("~/.docker/config.json")
+try:
+    cfg = json.load(open(path))
+except Exception:
+    sys.exit(0)
+
+for key in (host, "https://" + host, "http://" + host):
+    entry = (cfg.get("auths") or {}).get(key) or {}
+    if entry.get("auth"):
+        print(entry["auth"])
+        sys.exit(0)
+
+helper = (cfg.get("credHelpers") or {}).get(host) or cfg.get("credsStore")
+if helper:
+    try:
+        out = subprocess.run(["docker-credential-" + helper, "get"],
+                             input=host, capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            cred = json.loads(out.stdout)
+            tok = cred["Username"] + ":" + cred["Secret"]
+            print(base64.b64encode(tok.encode()).decode())
+    except Exception:
+        pass
+PYEOF
+) || true
+  [[ -n "$b64" ]] && AUTH_ARGS=(-H "Authorization: Basic $b64")
+  return 0
+}
+
+api() { curl -fsS "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" "$@"; }
+
+tag_digest() {
+  # HEAD request; the registry returns the manifest digest as a header
+  curl -fsSI "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" -H "Accept: $ACCEPT_MANIFEST" \
+      "$REGISTRY_URL/v2/$1/manifests/$2" \
+    | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'
+}
+
+cmd_ls() {
+  local IMAGE="" FULL=0
+  REGISTRY=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --full)        FULL=1; shift ;;
+      -r|--registry) REGISTRY="${2:?missing value for $1}"; shift 2 ;;
+      -h|--help)     usage 0 ;;
+      -*)            err "unknown option for ls: $1 (see --help)" ;;
+      *)             [[ -n "$IMAGE" ]] && err "unexpected argument: $1"
+                     IMAGE="$1"; shift ;;
+    esac
+  done
+
+  resolve_registry
+  command -v curl    >/dev/null 2>&1 || err "curl not found in PATH"
+  command -v python3 >/dev/null 2>&1 || err "python3 not found in PATH (needed for JSON parsing)"
+  setup_auth
+
+  local base="$REGISTRY_URL/v2"
+
+  # No image: list every repository in the registry
+  if [[ -z "$IMAGE" ]]; then
+    info "repositories in $REGISTRY_HOST:"
+    api "$base/_catalog?n=1000" \
+      | python3 2>/dev/null -c 'import json,sys
+for r in sorted(json.load(sys.stdin).get("repositories") or []): print(" ", r)' \
+      || err "could not list catalog (check registry address and auth)"
+    return 0
+  fi
+
+  # Tags for one repo
+  local tags
+  tags=$(api "$base/$IMAGE/tags/list" \
+    | python3 2>/dev/null -c 'import json,sys
+print("\n".join(json.load(sys.stdin).get("tags") or []))') \
+    || err "could not fetch tags for '$IMAGE' (does the repo exist? auth ok?)"
+  [[ -n "$tags" ]] || { info "no tags found for $IMAGE"; return 0; }
+  tags=$(printf '%s\n' "$tags" | sort -V)
+
+  if (( FULL )); then
+    printf '%-20s %-22s %-28s %s\n' "TAG" "DIGEST" "PLATFORMS" "CREATED"
+  else
+    printf '%-20s %s\n' "TAG" "DIGEST"
+  fi
+
+  local tag digest short minfo mtype platforms next cfg created
+  while IFS= read -r tag; do
+    digest=$(tag_digest "$IMAGE" "$tag" || true)
+    if [[ -n "$digest" ]]; then
+      short="${digest#sha256:}"; short="sha256:${short:0:12}"
+    else
+      short="(unknown)"
+    fi
+
+    if (( ! FULL )); then
+      printf '%-20s %s\n' "$tag" "$short"
+      continue
+    fi
+
+    # Full mode: fetch the manifest to get platforms and a config digest
+    minfo=$(api -H "Accept: $ACCEPT_MANIFEST" "$base/$IMAGE/manifests/$tag" \
+      | python3 2>/dev/null -c '
+import json, sys
+m = json.load(sys.stdin)
+if "manifests" in m:  # multi-arch index / manifest list
+    plats, first = [], ""
+    for e in m["manifests"]:
+        p = e.get("platform") or {}
+        if p.get("os") == "unknown":  # buildkit attestation entries
+            continue
+        plats.append("%s/%s" % (p.get("os", "?"), p.get("architecture", "?")))
+        first = first or e.get("digest", "")
+    print("index"); print(",".join(plats)); print(first)
+else:                 # single-arch manifest
+    print("manifest"); print(""); print((m.get("config") or {}).get("digest", ""))
+') || { printf '%-20s %-22s %s\n' "$tag" "$short" "(manifest fetch failed)"; continue; }
+
+    mtype=$(sed -n 1p <<<"$minfo")
+    platforms=$(sed -n 2p <<<"$minfo")
+    next=$(sed -n 3p <<<"$minfo")
+
+    # For an index, hop to one platform manifest to find its config blob
+    cfg="$next"
+    if [[ "$mtype" == "index" && -n "$next" ]]; then
+      cfg=$(api -H "Accept: $ACCEPT_MANIFEST" "$base/$IMAGE/manifests/$next" \
+        | python3 2>/dev/null -c 'import json,sys
+print((json.load(sys.stdin).get("config") or {}).get("digest", ""))') || cfg=""
+    fi
+
+    created=""
+    if [[ -n "$cfg" ]]; then
+      created=$(api "$base/$IMAGE/blobs/$cfg" \
+        | python3 2>/dev/null -c 'import json,sys
+print((json.load(sys.stdin).get("created") or "")[:19].replace("T", " "))') || created=""
+    fi
+
+    [[ "$mtype" == "manifest" ]] && platforms="(single arch)"
+    printf '%-20s %-22s %-28s %s\n' "$tag" "$short" "${platforms:-?}" "${created:-?}"
+  done <<< "$tags"
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────
+
+[[ $# -eq 0 ]] && usage 1
+
+if [[ "$1" == "ls" ]]; then
+  shift
+  cmd_ls "$@"
+  exit 0
+fi
+
+# ── Build mode: parse arguments ────────────────────────────────────
 
 IMAGE=""
 VERSION=""
@@ -75,8 +266,6 @@ EXTRA_TAGS=()
 ADD_LATEST=1
 NO_CACHE=0
 DRY_RUN=0
-
-[[ $# -eq 0 ]] && usage 1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,9 +290,7 @@ done
 [[ -n "$IMAGE" ]]   || err "image is required (-i)"
 [[ -n "$VERSION" ]] || err "version tag is required (-v)"
 
-load_registry
-REGISTRY="${REGISTRY:-$SAVED_REGISTRY}"
-[[ -n "$REGISTRY" ]] || err "no registry set. Use -r <host> or save one with: dbp --set-registry <host>"
+resolve_registry
 
 [[ -d "$CONTEXT" ]] || err "build context not found: $CONTEXT"
 
@@ -136,14 +323,14 @@ CMD=(docker buildx build --platform "$PLATFORMS" --push)
 [[ -n "$DOCKERFILE" ]] && CMD+=(-f "$DOCKERFILE")
 
 for t in "${UNIQUE_TAGS[@]}"; do
-  CMD+=(-t "$REGISTRY/$IMAGE:$t")
+  CMD+=(-t "$REGISTRY_HOST/$IMAGE:$t")
 done
 
 CMD+=("$CONTEXT")
 
 # ── Run ────────────────────────────────────────────────────────────
 
-info "registry:  $REGISTRY"
+info "registry:  $REGISTRY_HOST"
 info "image:     $IMAGE"
 info "tags:      ${UNIQUE_TAGS[*]}"
 info "platforms: $PLATFORMS"
@@ -160,4 +347,4 @@ fi
 "${CMD[@]}"
 
 echo
-info "done. pushed ${#UNIQUE_TAGS[@]} tag(s) for $REGISTRY/$IMAGE"
+info "done. pushed ${#UNIQUE_TAGS[@]} tag(s) for $REGISTRY_HOST/$IMAGE"
