@@ -8,13 +8,13 @@
 #   dbp -i <image> -v <version-tag> [options]
 #
 # Examples:
-#   dbp -i my-project -v 1.0.1
-#       -> builds and pushes <registry>/my-project:1.0.1 and :latest
+#   dbp -i wallplate-manager -v 1.0.1
+#       -> builds and pushes <registry>/wallplate-manager:1.0.1 and :latest
 #
-#   dbp -i my-project -v 1.0.1 -t stable -t prod
+#   dbp -i wallplate-manager -v 1.0.1 -t stable -t prod
 #       -> pushes :1.0.1, :latest, :stable, :prod
 #
-#   dbp --set-registry docker-registry.example.com
+#   dbp --set-registry docker-registry.lindisfarne.nsw.edu.au
 #       -> saves the registry so -r isn't needed again
 #
 # Options:
@@ -119,12 +119,14 @@ TAGS=("$VERSION")
 TAGS+=("${EXTRA_TAGS[@]+"${EXTRA_TAGS[@]}"}")
 
 # De-duplicate (e.g. if someone passes -t latest explicitly)
-declare -A seen=()
+# (plain loop rather than an associative array, for macOS bash 3.2 compatibility)
 UNIQUE_TAGS=()
 for t in "${TAGS[@]}"; do
-  [[ -n "${seen[$t]:-}" ]] && continue
-  seen[$t]=1
-  UNIQUE_TAGS+=("$t")
+  dup=0
+  for u in "${UNIQUE_TAGS[@]+"${UNIQUE_TAGS[@]}"}"; do
+    [[ "$t" == "$u" ]] && { dup=1; break; }
+  done
+  (( dup )) || UNIQUE_TAGS+=("$t")
 done
 
 # ── Build command ──────────────────────────────────────────────────
