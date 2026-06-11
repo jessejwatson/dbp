@@ -8,13 +8,13 @@
 #   dbp -i <image> -v <version-tag> [options]
 #
 # Examples:
-#   dbp -i wallplate-manager -v 1.0.1
-#       -> builds and pushes <registry>/wallplate-manager:1.0.1 and :latest
+#   dbp -i my-project -v 1.0.1
+#       -> builds and pushes <registry>/my-project:1.0.1 and :latest
 #
-#   dbp -i wallplate-manager -v 1.0.1 -t stable -t prod
+#   dbp -i my-project -v 1.0.1 -t stable -t prod
 #       -> pushes :1.0.1, :latest, :stable, :prod
 #
-#   dbp --set-registry docker-registry.lindisfarne.nsw.edu.au
+#   dbp --set-registry docker-registry.example.com
 #       -> saves the registry so -r isn't needed again
 #
 # Options:
